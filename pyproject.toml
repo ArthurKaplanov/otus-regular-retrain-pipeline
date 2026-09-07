@@ -1,0 +1,18 @@
+[project]
+name = "hw6-mlflow"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = "==3.12.8"
+dependencies = [
+    "numpy>=2.5.2",
+    "pandas>=3.0.5",
+    "pyspark==4.2.0",
+]
+
+[dependency-groups]
+dev = [
+    "findspark>=2.0.1",
+    "ipykernel>=7.3.0",
+    "pre-commit>=4.6.2",
+]
