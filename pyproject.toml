@@ -5,14 +5,42 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = "==3.12.8"
 dependencies = [
+    "mlflow>=3.16.0",
     "numpy>=2.5.2",
     "pandas>=3.0.5",
     "pyspark==4.2.0",
 ]
 
+# Указываем систему сборки, чтобы проект распознавался как пакет
+[build-system]
+requires = ["setuptools>=61.0.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+# Явно указываем, что код пакета лежит в папке src
+[tool.setuptools.packages.find]
+where = ["src"]
+
 [dependency-groups]
 dev = [
     "findspark>=2.0.1",
     "ipykernel>=7.3.0",
+    "make>=0.1.6.post2",
     "pre-commit>=4.6.2",
+    "python-dotenv>=1.2.3",
+    "ruff>=0.16.6",
+]
+
+[tool.ruff]
+# Целевая версия Python (укажите вашу, например, "py310")
+target-version = "py312"
+
+[tool.ruff.lint]
+# Список активированных правил для проверки
+select = [
+    "E",      # pycodestyle errors
+    "W",      # pycodestyle warnings
+    "F",      # pyflakes (ошибки синтаксиса, неиспользуемые импорты)
+    "B",      # flake8-bugbear (поиск потенциальных багов)
+    "I",      # isort (включает проверку сортировки импортов)
+    "UP",     # pyupgrade (предлагает синтаксис более новых версий Python)
 ]
