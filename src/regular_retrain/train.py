@@ -1,263 +1,314 @@
-
-import numpy as np
+import mlflow
+import mlflow.spark
 from loguru import logger
-from regular_retrain.config import (
-    AWS_SDK_VERSION,
-    PROJECT_PATH,
-    DATA_PATH,
-    DATA_SAMPLE_PATH,
-    DATA_MINI_SAMPLE_PATH,
-    HADOOP_VERSION,
-    YC_ACCESS_KEY,
-    YC_SECRET_KEY,
-)
 from pyspark.ml import Pipeline
-from pyspark.ml.classification import LogisticRegression
+from pyspark.ml.classification import RandomForestClassifier
+from pyspark.ml.evaluation import (
+    BinaryClassificationEvaluator,
+    MulticlassClassificationEvaluator,
+)
 from pyspark.ml.feature import (
     StandardScaler,
     VectorAssembler,
 )
-from pyspark.ml.evaluation import MulticlassClassificationEvaluator
 from pyspark.ml.tuning import ParamGridBuilder, TrainValidationSplit
-from pyspark.sql import SparkSession
+from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as f
+from pyspark.sql.utils import AnalysisException
 
-from pyspark.sql.window import Window
-
-logger.info("Start session")
-spark = (
-    SparkSession.builder \
-    .appName("YandexCloudStorage") \
-    .master("local[*]")\
-    .config("spark.jars.packages", f"org.apache.hadoop:hadoop-aws:{HADOOP_VERSION},com.amazonaws:aws-java-sdk-bundle:{AWS_SDK_VERSION}") \
-    .config("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem") \
-    .config("spark.hadoop.fs.s3a.endpoint", "storage.yandexcloud.net") \
-    .config("spark.hadoop.fs.s3a.access.key", YC_ACCESS_KEY) \
-    .config("spark.hadoop.fs.s3a.secret.key", YC_SECRET_KEY) \
-    .config("spark.hadoop.fs.s3a.fast.upload", "true") \
-    .config("spark.hadoop.fs.s3a.fast.upload.buffer", "bytebuffer")\
-    .config("spark.driver.memory", "4g")\
-    .getOrCreate()
+from regular_retrain.config import (
+    APP_NAME,
+    AWS_SDK_VERSION,
+    DATA_W_FEATURES_PATH,
+    HADOOP_VERSION,
+    YC_ACCESS_KEY,
+    YC_SECRET_KEY,
 )
 
-from pyspark.sql.types import (
-    DoubleType,
-    IntegerType,
-    StructField,
-    StructType,
-    TimestampType,
-)
 
-schema = StructType(
-    [
-        StructField("transaction_id", IntegerType(), True),
-        StructField("tx_datetime", TimestampType(), True),
-        StructField("customer_id", IntegerType(), True),
-        StructField("terminal_id", IntegerType(), True),
-        StructField("tx_amount", DoubleType(), True),
-        StructField("tx_time_seconds", IntegerType(), True),
-        StructField("tx_time_days", IntegerType(), True),
-        StructField("tx_fraud", IntegerType(), True),
-        StructField("tx_fraud_scenario", IntegerType(), True),
-    ]
+def create_spark_session(
+        app_name:str=APP_NAME,
+        yc_access_key=YC_ACCESS_KEY,
+        yc_secret_key=YC_SECRET_KEY
+        ) -> SparkSession.Builder:
+    """func to create a spark builder
 
-)
+    Args:
+        app_name (str, optional): _description_. Defaults to APP_NAME.
+        yc_access_key (_type_, optional): _description_. Defaults to YC_ACCESS_KEY.
+        yc_secret_key (_type_, optional): _description_. Defaults to YC_SECRET_KEY.
 
-spark.sparkContext.setLogLevel("WARN")
+    Returns:
+        SparkSession.Builder: создаем builder
+    """
+    spark = (
+         SparkSession.builder.appName(app_name)
+            .master("local[*]")
+            .config(
+                "spark.jars.packages",
+                f"org.apache.hadoop:hadoop-aws:{HADOOP_VERSION},com.amazonaws:aws-java-sdk-bundle:{AWS_SDK_VERSION}",
+            )
+            .config(
+                "spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem"
+                )
+            .config("spark.hadoop.fs.s3a.endpoint", "storage.yandexcloud.net")
+            .config("spark.hadoop.fs.s3a.access.key", yc_access_key)
+            .config("spark.hadoop.fs.s3a.secret.key", yc_secret_key)
+            .config("spark.hadoop.fs.s3a.fast.upload", "true")
+            .config("spark.hadoop.fs.s3a.fast.upload.buffer", "bytebuffer")
+            .config("spark.driver.memory", "3g")
+            )
+    return spark
 
-logger.info("Data reading is coming")
-df = spark.read.parquet(DATA_PATH).filter("tx_datetime >= '2019-11-24 00:00:00'")
-logger.info("Data was read succesfully ")
-# ---
+def get_classes_weight(data: DataFrame, fraud_class:float=1.0) -> tuple:
+    """ РАСЧЕТ ВЕСОВ КЛАССОВ (Борьба с дисбалансом)
 
-logger.info("Starting feature engineering")
-SEC_5_MIN = 5 * 60
-SEC_1_HOUR = 60 * 60
-SEC_24_HOURS = 24 * 60 * 60
-SEC_7_DAYS = 7 * 24 * 60 * 60
-SEC_30_DAYS = 30 * 24 * 60 * 60
+    Args:
+        data (DataFrame): _description_
+        fraud_class (float, optional): _description_. Defaults to 1.0.
 
-def get_customer_window(seconds):
-    return (
-        Window
-        .partitionBy("customer_id")
-        .orderBy("tx_time_seconds")
-        .rangeBetween(-seconds, -1)
+    Returns:
+        tuple: _description_
+    """
+    total_count = data.count()
+    frauds_count = data.filter(f.col("tx_fraud") == fraud_class).count()
+    legit_count = total_count - frauds_count
+
+    weight_for_legit = total_count / (2.0 * legit_count)
+    weight_for_fraud = total_count / (2.0 * frauds_count)
+    return weight_for_legit, weight_for_fraud
+
+
+def create_relative_features(data: DataFrame) -> DataFrame:
+    """ГЕНЕРАЦИЯ ОТНОСИТЕЛЬНЫХ ФИЧ (Борьба со слепотой модели)
+    # 1. Отношение суммы текущей транзакции к среднему чеку клиента за день
+    # 2. Доля трат за последние 5 минут от всех дневных трат клиента
+    # 3. Плотность транзакций: какая доля дневных операций пришлась на последний час
+    # 4. Интенсивность смены терминалов: сколько уникальных точек приходится
+    # на одну транзакцию за 5 минут
+    Args:
+        data (DataFrame): _description_
+
+    Returns:
+        DataFrame: _description_
+    """
+    need_columns = {
+        'tx_amount',
+        'customer_avg_amount_today',
+        'customer_amount_sum_5m',
+        'customer_amount_sum_today',
+        'customer_tx_count_1h',
+        'customer_tx_count_today',
+        'customer_unique_terminals_5m',
+        'customer_tx_count_5m'
+    }
+    existed_columns = set(data.columns)
+    if not need_columns.issubset(existed_columns):
+        lost_columns = need_columns.difference(existed_columns)
+        raise AnalysisException(f"We can't find the next columns {lost_columns}")
+
+
+    df = data.withColumn(
+    "ratio_amount_to_avg_today",
+    f.col("tx_amount") / (f.col("customer_avg_amount_today") + 1.0),
+    )
+    df = df.withColumn(
+        "ratio_amount_5m_to_today",
+        f.col("customer_amount_sum_5m") / (f.col("customer_amount_sum_today") + 1.0),
+    )
+    df = df.withColumn(
+        "ratio_count_1h_to_today",
+        f.col("customer_tx_count_1h") / (f.col("customer_tx_count_today") + 1.0),
+    )
+    df = df.withColumn(
+        "ratio_terminals_per_tx_5m",
+        f.col("customer_unique_terminals_5m") / (f.col("customer_tx_count_5m") + 1.0),
+    )
+    return df
+
+
+def split_data(data:DataFrame) -> tuple[DataFrame, DataFrame]:
+    train, test = data.randomSplit([0.8, 0.2], seed=42)
+    return train, test
+
+def train_spark_model(train_data:DataFrame, evaluator):
+
+    numeric_assembler = VectorAssembler(
+        inputCols=[
+            # --- НОВЫЕ ОТНОСИТЕЛЬНЫЕ ФИЧИ (Сигналы аномалий) ---
+            "ratio_amount_to_avg_today",
+            "ratio_amount_5m_to_today",
+            "ratio_count_1h_to_today",
+            "ratio_terminals_per_tx_5m",
+            # ----------------------------------------------------
+            # Базовые фичи транзакции
+            "tx_amount",
+            "tx_time_seconds",
+            "tx_time_days",
+            # Исходные 24-часовые агрегаты по клиенту
+            "customer_amount_sum_today",
+            "customer_tx_count_today",
+            "customer_avg_amount_today",
+            # Velocity-фичи: Количество транзакций (5 минут и 1 час)
+            "customer_tx_count_5m",
+            "customer_tx_count_1h",
+            # Velocity-фичи: Суммы транзакций (5 минут и 1 час)
+            "customer_amount_sum_5m",
+            "customer_amount_sum_1h",
+            # Уникальные терминалы за разные окна
+            "customer_unique_terminals_5m",
+            "customer_unique_terminals_1h",
+            "customer_unique_terminals_24h",
+            # Разнообразие терминалов (Diversity)
+            "customer_terminal_diversity_5m",
+            "customer_terminal_diversity_1h",
+            # История и временные интервалы между транзакциями
+            "customer_has_prev_tx",
+            "customer_seconds_since_prev_tx",
+            # Циклические фичи времени
+            "hour_sin",
+            "hour_cos",
+        ],
+        outputCol="numeric_features",
+        handleInvalid="skip",
     )
 
-w_customer_today = get_customer_window(SEC_24_HOURS)
-w_terminal_today = (
-    Window
-    .partitionBy("terminal_id")
-    .orderBy("tx_time_seconds")
-    .rangeBetween(-SEC_24_HOURS, -1)
-)
-
-# Новые окна по клиенту на разные интервалы
-w_cust_5m = get_customer_window(SEC_5_MIN)
-w_cust_1h = get_customer_window(SEC_1_HOUR)
-w_cust_7d = get_customer_window(SEC_7_DAYS)
-w_cust_30d = get_customer_window(SEC_30_DAYS)
-
-
-df_result = df.withColumns({
-    # --- Ваши текущие фичи (исправленные на честный 24h range) ---
-    "customer_amount_sum_today": f.sum("tx_amount").over(w_customer_today),
-    "terminal_amount_sum_today": f.sum("tx_amount").over(w_terminal_today),
-    "customer_tx_count_today": f.count("transaction_id").over(w_customer_today),
-    "terminal_tx_count_today": f.count("transaction_id").over(w_terminal_today),
-    "customer_avg_amount_today": f.avg("tx_amount").over(w_customer_today),
-    "terminal_avg_amount_today": f.avg("tx_amount").over(w_terminal_today),
-
-    # --- Новые Velocity Features: Количество транзакций ---
-    "customer_tx_count_5m": f.count("transaction_id").over(w_cust_5m),
-    "customer_tx_count_1h": f.count("transaction_id").over(w_cust_1h),
-    "customer_tx_count_7d": f.count("transaction_id").over(w_cust_7d),
-
-    # --- Новые Velocity Features: Сумма транзакций ---
-    "customer_amount_sum_5m": f.sum("tx_amount").over(w_cust_5m),
-    "customer_amount_sum_1h": f.sum("tx_amount").over(w_cust_1h),
-    "customer_amount_sum_7d": f.sum("tx_amount").over(w_cust_7d),
-
-    # --- Средний чек за 30 дней и сравнение ---
-    "customer_avg_amount_30d": f.avg("tx_amount").over(w_cust_30d),
-    # Отношение текущего чека к среднему за месяц (добавляем 1 костыль от деления на 0)
-    "customer_current_vs_avg_30d": (
-        f.when(
-            (f.avg("tx_amount").over(w_cust_30d).isNull()) |
-            (f.avg("tx_amount").over(w_cust_30d) == 0.0),
-            f.lit(1.0) # Если истории нет или среднее равно 0, отношение будет 1.0 (или другое дефолтное значение)
-        ).otherwise(
-            f.col("tx_amount") / f.avg("tx_amount").over(w_cust_30d)
-        )
-    ),
-
-    # Циклические фичи времени
-    "hour_sin": f.sin(2 * 3.141592653589793 * f.hour("tx_datetime") / 24),
-    "hour_cos": f.cos(2 * 3.141592653589793 * f.hour("tx_datetime") / 24),
-})
-
-
-
-# 5. Заполнение пустых значений (если истории за период нет, возвращаем 0)
-fill_dict = {
-    "customer_amount_sum_today": 0.0, "customer_avg_amount_today": 0.0,
-    "terminal_amount_sum_today": 0.0, "terminal_avg_amount_today": 0.0,
-    "customer_tx_count_5m": 0, "customer_tx_count_1h": 0, "customer_tx_count_7d": 0,
-    "customer_amount_sum_5m": 0.0, "customer_amount_sum_1h": 0.0, "customer_amount_sum_7d": 0.0,
-    "customer_avg_amount_30d": 0.0, "customer_current_vs_avg_30d": 1.0
-}
-
-df_result = df_result.fillna(fill_dict)
-logger.info("Feature engineering is completed")
-# ---
-
-numeric_assembler = VectorAssembler(
-    inputCols=[
-        # Базовые фичи транзакции
-        "tx_amount",
-
-        # Ваши исходные фичи (честные 24-часовые агрегаты)
-        "customer_amount_sum_today",
-        "customer_tx_count_today",
-        "customer_avg_amount_today",
-        "terminal_amount_sum_today",
-        "terminal_tx_count_today",
-        "terminal_avg_amount_today",
-
-        # Новые Velocity-фичи (Количество транзакций)
-        "customer_tx_count_5m",
-        "customer_tx_count_1h",
-        "customer_tx_count_7d",
-
-        # Новые Velocity-фичи (Суммы транзакций)
-        "customer_amount_sum_5m",
-        "customer_amount_sum_1h",
-        "customer_amount_sum_7d",
-
-        # Контекст среднего чека за месяц
-        "customer_avg_amount_30d",
-        "customer_current_vs_avg_30d",
-
-        # Циклические фичи времени
-        "hour_sin",
-        "hour_cos"
-    ],
-    outputCol="numeric_features",
-    # handleInvalid="skip" # Опционально: пропустить строки с null, если они появятся вне fillna
-)
-
-scaler = StandardScaler(
-    inputCol="numeric_features",
-    outputCol="features",
-    withStd=True,
-    withMean=True,
-)
-
-lr = LogisticRegression(
-    featuresCol="features",
-    labelCol="tx_fraud",
-)
-
-pipeline = Pipeline(
-    stages=[
-        numeric_assembler,
-        scaler,
-        lr,
-    ]
-)
-grid = (
-    ParamGridBuilder()
-    .addGrid(lr.regParam, [0.01,0.1, 0.5])
-    .addGrid(lr.elasticNetParam, [0.0, 0.5, 1.0])
-    .build()
+    scaler = StandardScaler(
+        inputCol="numeric_features",
+        outputCol="features",
+        withStd=True,
+        withMean=True,
     )
 
-evaluator = MulticlassClassificationEvaluator(
-    labelCol="tx_fraud",
-    predictionCol="prediction",
-    metricName="recallByLabel",
-    metricLabel=1.0
-)
+    rf = RandomForestClassifier(
+        featuresCol="features",
+        labelCol="tx_fraud",
+        weightCol="class_weight",
+        numTrees=35,
+        seed=42,
+    )
 
-tvs = (
-    TrainValidationSplit(
-        estimator=pipeline,
-        estimatorParamMaps=grid,
+    pipeline_rf = Pipeline(
+        stages=[
+            numeric_assembler,
+            scaler,
+            rf,
+        ]
+    )
+
+    grid_rf = ParamGridBuilder().addGrid(rf.maxDepth, [3, 7]).build()
+
+    tvs = TrainValidationSplit(
+        estimator=pipeline_rf,
+        estimatorParamMaps=grid_rf,
         evaluator=evaluator,
-    parallelism=1, seed=42)
+        trainRatio=0.8,
+        parallelism=1,
+        seed=42,
     )
 
-# Разделим данные
-logger.info("Starting data separation")
-train, test = df_result.randomSplit([0.8, 0.2], seed=42)
+    logger.info("Starting training/validation process")
+    tvsModel = tvs.fit(train_data)
+    logger.info("Finishing training/validation process")
 
-logger.info("Starting training/validation process")
-tvsModel = tvs.fit(train)
-logger.info("Finishing training/validation process")
-best_model = tvsModel.bestModel
+    best_model = tvsModel.bestModel
+    best_dt = best_model.stages[-1]
+    return best_model, best_dt
 
 
-best_lr = best_model.stages[-1]
+def register_model(experiment_name):
+    """Register a new model if it's not existing
 
-print("regParam:", best_lr.getRegParam())
-print("elasticNetParam:", best_lr.getElasticNetParam())
+    Args:
+        experiment_name (_type_): name of experiment
+    """
+    def check_model_is_exist(client: mlflow.MlflowClient, model_name) -> bool:
+        """ check the model is existing
+        Returns:
+            bool: _description_
+        """
+        try:
+            logger.info(f"Проверяем существует ли модель {model_name}")
+            client.get_registered_model(model_name)
+            logger.info(f"Модель '{model_name}' уже зарегистрирована")
+            return True
+        except Exception as e:
+            logger.info(f"Создаем новую модель: {str(e)}")
+            logger.info(f"Создана новая регистрированная модель '{model_name}'")
+            return False
 
-for params, metric in zip(grid, tvsModel.validationMetrics):
-    print(
-        "regParam:",
-        params[lr.regParam],
-        "elasticNetParam:",
-        params[lr.elasticNetParam],
-        "recall:",
-        metric,
+    print(f"DEBUG: Сравниваем и регистрируем модель для эксперимента {experiment_name}")
+    client = mlflow.MlflowClient()
+
+    # Имя модели
+    model_name = f"{experiment_name}_model"
+    print(f"DEBUG: Имя модели: {model_name}")
+
+    if not check_model_is_exist(client, model_name):
+        client.create_registered_model(model_name)
+
+def main():
+
+    tracking_uri = "http://localhost:5005/"
+    experiment_name = "fraud_detections"
+
+    mlflow.set_tracking_uri(tracking_uri)
+    mlflow.set_experiment(experiment_name)
+
+    logger.info("Start session")
+    spark = create_spark_session(APP_NAME,YC_ACCESS_KEY,YC_SECRET_KEY).getOrCreate()
+    spark.sparkContext.setLogLevel("WARN")
+
+    logger.info("Data reading is coming")
+    df = spark.read.parquet(DATA_W_FEATURES_PATH)
+    logger.info("Data was read successfully")
+
+    logger.info("Calculating class weights...")
+    weight_for_legit, weight_for_fraud = get_classes_weight(df)
+    df = df.withColumn(
+        "class_weight",
+        f.when(f.col("tx_fraud") == 1.0, weight_for_fraud).otherwise(weight_for_legit),
+    )
+
+    logger.info("Start creating a new feature for dataframe")
+    df = create_relative_features(df)
+    logger.info("Finished creating new features for dataframe")
+
+    evaluator_recall = MulticlassClassificationEvaluator(
+        labelCol="tx_fraud",
+        predictionCol="prediction",
+        metricName="recallByLabel",
+        metricLabel=1.0,
+    )
+
+    evaluator = BinaryClassificationEvaluator(
+        labelCol="tx_fraud",
+        rawPredictionCol="probability",  # используем вектор вероятностей
+        metricName="areaUnderPR",  # лучшая метрика для фрода
     )
 
 
+    with mlflow.start_run(run_name="fraud_detection_model"):
 
-# оценка теста
-test_predictions = best_model.transform(test)
+        train, test = split_data(df)
+        best_model, best_dt = train_spark_model(train, evaluator)
 
-test_recall = evaluator.evaluate(test_predictions)
+        logger.info("Best maxDepth:", best_dt.getMaxDepth())
+        mlflow.log_params({"Best maxDepth": best_dt.getMaxDepth()})
 
-print("Test recall:", test_recall)
+        test_predictions = best_model.transform(test)
+
+        test_pr_auc = evaluator.evaluate(test_predictions)
+        test_recall = evaluator_recall.evaluate(test_predictions)
+
+        mlflow.log_metrics({"PR AUC":test_pr_auc, "Recall":test_recall})
+        logger.info(f"\nTest PR AUC: {test_pr_auc:.4f}")
+        logger.info(f"Test recall (at default 0.5 threshold): {test_recall:.4f}")
+
+        mlflow.spark.log_model(best_model, "model")
+
+        register_model(experiment_name)
+
+
+if __name__ == "__main__":
+    main()
