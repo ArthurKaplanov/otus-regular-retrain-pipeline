@@ -5,6 +5,7 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = "==3.12.8"
 dependencies = [
+    "boto3==1.37.16",
     "loguru>=0.7.3",
     "mlflow>=3.16.0",
     "numpy>=2.5.2",
@@ -23,6 +24,8 @@ where = ["src"]
 
 [dependency-groups]
 dev = [
+    "apache-airflow==2.11.1",
+    "apache-airflow-providers-yandex>=4.6.0",
     "findspark>=2.0.1",
     "ipykernel>=7.3.0",
     "make>=0.1.6.post2",

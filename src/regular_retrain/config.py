@@ -5,8 +5,12 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-YC_ACCESS_KEY = os.getenv("YC_ACCESS_KEY")
-YC_SECRET_KEY = os.getenv("YC_SECRET_KEY")
+YC_ACCESS_KEY               = os.getenv("YC_ACCESS_KEY")
+YC_SECRET_KEY               = os.getenv("YC_SECRET_KEY")
+MLFLOW_TRACKING_URI         = os.getenv("MLFLOW_TRACKING_URI")
+MLFLOW_S3_ENDPOINT_URL      = os.getenv("MLFLOW_S3_ENDPOINT_URL")
+AWS_ACCESS_KEY_ID           = os.getenv("AWS_ACCESS_KEY_ID")
+AWS_SECRET_ACCESS_KEY       = os.getenv("AWS_SECRET_ACCESS_KEY")
 
 CONFIG_FILE_PATH = Path(__file__).resolve()
 PROJECT_PATH = CONFIG_FILE_PATH.parent.parent.parent
@@ -21,5 +25,4 @@ DATA_SAMPLE_PATH = "s3a://data-b1gbov23vlrhokj7jp58/sample_from_20_to_24_novembe
 HADOOP_VERSION="3.5.0"
 AWS_SDK_VERSION ="1.12.262"
 
-# spark
 APP_NAME = "TRAIN MODEL APP"

@@ -18,3 +18,9 @@ wheels/
 # data
 data/*
 model/*
+
+#terraform
+*.tfvars
+.terraform/
+*.tfstate*
+infra/*.json
